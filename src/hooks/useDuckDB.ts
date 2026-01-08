@@ -1,0 +1,195 @@
+import { useState, useEffect, useCallback, useRef } from 'react';
+import * as duckdb from '@duckdb/duckdb-wasm';
+import duckdb_wasm from '@duckdb/duckdb-wasm/dist/duckdb-mvp.wasm?url';
+import duckdb_worker from '@duckdb/duckdb-wasm/dist/duckdb-browser-mvp.worker.js?url';
+import type { QueryResult, ColumnInfo, LoadedFile, FileFormat } from '../types';
+import * as XLSX from 'xlsx';
+
+function detectFormat(filename: string): FileFormat {
+  const ext = filename.toLowerCase().split('.').pop();
+  switch (ext) {
+    case 'csv': return 'csv';
+    case 'tsv': return 'tsv';
+    case 'parquet': return 'parquet';
+    case 'xlsx': return 'xlsx';
+    case 'xls': return 'xls';
+    case 'json': return 'json';
+    default: return 'csv';
+  }
+}
+
+function sanitizeTableName(filename: string): string {
+  const base = filename.replace(/\.[^.]+$/, '');
+  return base.replace(/[^a-zA-Z0-9_]/g, '_').replace(/^[0-9]/, '_$&');
+}
+
+export function useDuckDB() {
+  const [db, setDb] = useState<duckdb.AsyncDuckDB | null>(null);
+  const [conn, setConn] = useState<duckdb.AsyncDuckDBConnection | null>(null);
+  const [isLoading, setIsLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
+  const [loadedFiles, setLoadedFiles] = useState<LoadedFile[]>([]);
+  const initPromise = useRef<Promise<void> | null>(null);
+
+  useEffect(() => {
+    if (initPromise.current) return;
+
+    initPromise.current = (async () => {
+      try {
+        const worker = new Worker(duckdb_worker);
+        const logger = new duckdb.ConsoleLogger();
+        const database = new duckdb.AsyncDuckDB(logger, worker);
+        await database.instantiate(duckdb_wasm);
+        const connection = await database.connect();
+        setDb(database);
+        setConn(connection);
+        setIsLoading(false);
+      } catch (err) {
+        setError(err instanceof Error ? err.message : 'Failed to initialize DuckDB');
+        setIsLoading(false);
+      }
+    })();
+  }, []);
+
+  const executeQuery = useCallback(async (sql: string): Promise<QueryResult> => {
+    if (!conn) throw new Error('Database not initialized');
+
+    const result = await conn.query(sql);
+    const columns = result.schema.fields.map(f => f.name);
+    const rows: Record<string, unknown>[] = [];
+
+    for (let i = 0; i < result.numRows; i++) {
+      const row: Record<string, unknown> = {};
+      for (const col of columns) {
+        const value = result.getChild(col)?.get(i);
+        row[col] = value;
+      }
+      rows.push(row);
+    }
+
+    return { columns, rows, rowCount: result.numRows };
+  }, [conn]);
+
+  const loadFile = useCallback(async (file: File): Promise<LoadedFile> => {
+    if (!db || !conn) throw new Error('Database not initialized');
+
+    const format = detectFormat(file.name);
+    const tableName = sanitizeTableName(file.name);
+
+    // Drop table if exists
+    await conn.query(`DROP TABLE IF EXISTS "${tableName}"`);
+
+    if (format === 'xlsx' || format === 'xls') {
+      // Handle Excel files via SheetJS
+      const buffer = await file.arrayBuffer();
+      const workbook = XLSX.read(buffer, { type: 'array' });
+      const firstSheet = workbook.Sheets[workbook.SheetNames[0]];
+      const csvData = XLSX.utils.sheet_to_csv(firstSheet);
+
+      // Register CSV data as a file
+      await db.registerFileText(`${tableName}.csv`, csvData);
+      await conn.query(`CREATE TABLE "${tableName}" AS SELECT * FROM read_csv_auto('${tableName}.csv')`);
+    } else if (format === 'csv' || format === 'tsv') {
+      const text = await file.text();
+      await db.registerFileText(file.name, text);
+      const delimiter = format === 'tsv' ? '\t' : ',';
+      await conn.query(`CREATE TABLE "${tableName}" AS SELECT * FROM read_csv_auto('${file.name}', delim='${delimiter}')`);
+    } else if (format === 'parquet') {
+      const buffer = await file.arrayBuffer();
+      await db.registerFileBuffer(file.name, new Uint8Array(buffer));
+      await conn.query(`CREATE TABLE "${tableName}" AS SELECT * FROM read_parquet('${file.name}')`);
+    } else if (format === 'json') {
+      const text = await file.text();
+      await db.registerFileText(file.name, text);
+      await conn.query(`CREATE TABLE "${tableName}" AS SELECT * FROM read_json_auto('${file.name}')`);
+    }
+
+    // Get table info
+    const schemaResult = await conn.query(`DESCRIBE "${tableName}"`);
+    const columns: ColumnInfo[] = [];
+    for (let i = 0; i < schemaResult.numRows; i++) {
+      columns.push({
+        name: schemaResult.getChild('column_name')?.get(i) as string,
+        type: schemaResult.getChild('column_type')?.get(i) as string,
+      });
+    }
+
+    const countResult = await conn.query(`SELECT COUNT(*) as cnt FROM "${tableName}"`);
+    const rowCount = Number(countResult.getChild('cnt')?.get(0) ?? 0);
+
+    const loadedFile: LoadedFile = {
+      name: file.name,
+      tableName,
+      format,
+      columns,
+      rowCount,
+    };
+
+    setLoadedFiles(prev => [...prev.filter(f => f.tableName !== tableName), loadedFile]);
+
+    return loadedFile;
+  }, [db, conn]);
+
+  const exportData = useCallback(async (
+    sql: string,
+    format: FileFormat,
+    _filename: string
+  ): Promise<Blob> => {
+    if (!conn || !db) throw new Error('Database not initialized');
+
+    const tempTable = `_export_${Date.now()}`;
+    await conn.query(`CREATE TEMP TABLE ${tempTable} AS ${sql}`);
+
+    let blob: Blob;
+
+    if (format === 'csv' || format === 'tsv') {
+      const delimiter = format === 'tsv' ? '\t' : ',';
+      const exportFile = `${tempTable}.${format}`;
+      await conn.query(`COPY ${tempTable} TO '${exportFile}' (DELIMITER '${delimiter}', HEADER)`);
+      const buffer = await db.copyFileToBuffer(exportFile);
+      blob = new Blob([new Uint8Array(buffer).buffer as ArrayBuffer], { type: 'text/plain' });
+    } else if (format === 'parquet') {
+      const exportFile = `${tempTable}.parquet`;
+      await conn.query(`COPY ${tempTable} TO '${exportFile}' (FORMAT PARQUET)`);
+      const buffer = await db.copyFileToBuffer(exportFile);
+      blob = new Blob([new Uint8Array(buffer).buffer as ArrayBuffer], { type: 'application/octet-stream' });
+    } else if (format === 'json') {
+      const result = await executeQuery(`SELECT * FROM ${tempTable}`);
+      blob = new Blob([JSON.stringify(result.rows, null, 2)], { type: 'application/json' });
+    } else if (format === 'xlsx' || format === 'xls') {
+      const result = await executeQuery(`SELECT * FROM ${tempTable}`);
+      const ws = XLSX.utils.json_to_sheet(result.rows);
+      const wb = XLSX.utils.book_new();
+      XLSX.utils.book_append_sheet(wb, ws, 'Data');
+      const buffer = XLSX.write(wb, { bookType: format === 'xlsx' ? 'xlsx' : 'xls', type: 'array' });
+      blob = new Blob([buffer], { type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' });
+    } else {
+      throw new Error(`Unsupported export format: ${format}`);
+    }
+
+    await conn.query(`DROP TABLE ${tempTable}`);
+
+    return blob;
+  }, [conn, db, executeQuery]);
+
+  const downloadBlob = useCallback((blob: Blob, filename: string) => {
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = filename;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+  }, []);
+
+  return {
+    isLoading,
+    error,
+    loadedFiles,
+    executeQuery,
+    loadFile,
+    exportData,
+    downloadBlob,
+  };
+}
