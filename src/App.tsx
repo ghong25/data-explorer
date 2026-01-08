@@ -1,10 +1,13 @@
-import { useState, useCallback, useMemo } from 'react';
+import { useState, useCallback, useMemo, useEffect } from 'react';
 import { useDuckDB } from './hooks/useDuckDB';
+import { useFilePersistence } from './hooks/useFilePersistence';
 import { FileDropZone } from './components/FileDropZone';
 import { DataGrid } from './components/DataGrid';
 import { SqlEditor } from './components/SqlEditor';
 import { RegexSearch } from './components/RegexSearch';
 import { ExportPanel } from './components/ExportPanel';
+import { JoinWizard } from './components/JoinWizard';
+import { getPersistedFile } from './utils/indexedDB';
 import type { QueryResult, FileFormat, LoadedFile } from './types';
 
 type ViewMode = 'data' | 'sql';
@@ -16,9 +19,17 @@ function App() {
     loadedFiles,
     executeQuery,
     loadFile,
+    loadFileFromContent,
+    createJoinedTable,
     exportData,
     downloadBlob,
   } = useDuckDB();
+
+  const {
+    saveFile,
+    getLastUsedFileId,
+    clearSavedData,
+  } = useFilePersistence();
 
   const [currentFile, setCurrentFile] = useState<LoadedFile | null>(null);
   const [viewMode, setViewMode] = useState<ViewMode>('data');
@@ -29,6 +40,48 @@ function App() {
   const [isExporting, setIsExporting] = useState(false);
   const [quickFilter, setQuickFilter] = useState('');
   const [error, setError] = useState<string | null>(null);
+  const [showJoinWizard, setShowJoinWizard] = useState(false);
+  const [restoreNotification, setRestoreNotification] = useState<string | null>(null);
+  const [isRestoring, setIsRestoring] = useState(false);
+
+  // Auto-restore last used file on mount
+  useEffect(() => {
+    if (dbLoading || currentFile) return;
+
+    const restoreLastFile = async () => {
+      try {
+        const lastId = await getLastUsedFileId();
+        if (!lastId) return;
+
+        setIsRestoring(true);
+        const persisted = await getPersistedFile(lastId);
+        if (!persisted) {
+          setRestoreNotification('Previous session could not be restored');
+          setTimeout(() => setRestoreNotification(null), 3000);
+          return;
+        }
+
+        // Load the file content into DuckDB
+        const loaded = await loadFileFromContent(
+          persisted.content,
+          persisted.name,
+          persisted.format
+        );
+        setCurrentFile(loaded);
+        const result = await executeQuery(`SELECT * FROM "${loaded.tableName}" LIMIT 1000`);
+        setQueryResult(result);
+        setLastQuery(`SELECT * FROM "${loaded.tableName}"`);
+      } catch (err) {
+        console.error('Failed to restore file:', err);
+        setRestoreNotification('Previous session could not be restored');
+        setTimeout(() => setRestoreNotification(null), 3000);
+      } finally {
+        setIsRestoring(false);
+      }
+    };
+
+    restoreLastFile();
+  }, [dbLoading, currentFile, getLastUsedFileId, loadFileFromContent, executeQuery]);
 
   const handleFileSelect = useCallback(async (file: File) => {
     setIsFileLoading(true);
@@ -40,12 +93,38 @@ function App() {
       setQueryResult(result);
       setLastQuery(`SELECT * FROM "${loaded.tableName}"`);
       setViewMode('data');
+
+      // Save to persistence for auto-restore on next visit
+      try {
+        await saveFile(file);
+      } catch (persistError) {
+        console.warn('Failed to persist file:', persistError);
+      }
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Failed to load file');
     } finally {
       setIsFileLoading(false);
     }
-  }, [loadFile, executeQuery]);
+  }, [loadFile, executeQuery, saveFile]);
+
+  const handleJoinComplete = useCallback(async (result: LoadedFile) => {
+    setShowJoinWizard(false);
+    setCurrentFile(result);
+    const queryResult = await executeQuery(`SELECT * FROM "${result.tableName}" LIMIT 1000`);
+    setQueryResult(queryResult);
+    setLastQuery(`SELECT * FROM "${result.tableName}"`);
+    setViewMode('data');
+  }, [executeQuery]);
+
+  const handleClearSavedData = useCallback(async () => {
+    try {
+      await clearSavedData();
+      setRestoreNotification('Saved data cleared');
+      setTimeout(() => setRestoreNotification(null), 2000);
+    } catch (err) {
+      console.error('Failed to clear saved data:', err);
+    }
+  }, [clearSavedData]);
 
   const handleQueryExecute = useCallback(async (sql: string) => {
     setIsQueryRunning(true);
@@ -128,7 +207,7 @@ function App() {
     return queryResult?.columns || [];
   }, [queryResult]);
 
-  if (dbLoading) {
+  if (dbLoading || isRestoring) {
     return (
       <div className="flex items-center justify-center min-h-screen bg-gray-100">
         <div className="text-center">
@@ -136,7 +215,9 @@ function App() {
             <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" fill="none" />
             <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z" />
           </svg>
-          <p className="text-gray-600">Initializing DuckDB...</p>
+          <p className="text-gray-600">
+            {isRestoring ? 'Restoring previous session...' : 'Initializing DuckDB...'}
+          </p>
         </div>
       </div>
     );
@@ -157,7 +238,24 @@ function App() {
     <div className="flex flex-col h-screen bg-gray-100">
       {/* Header */}
       <header className="bg-white border-b px-4 py-3 flex items-center justify-between">
-        <h1 className="text-xl font-bold text-gray-800">Data Explorer</h1>
+        <div className="flex items-center gap-4">
+          <h1 className="text-xl font-bold text-gray-800">Data Explorer</h1>
+          {loadedFiles.length >= 1 && (
+            <button
+              onClick={() => setShowJoinWizard(true)}
+              className="px-3 py-1 text-sm bg-purple-600 text-white rounded hover:bg-purple-700"
+            >
+              Join Tables
+            </button>
+          )}
+          <button
+            onClick={handleClearSavedData}
+            className="px-2 py-1 text-xs text-gray-500 hover:text-gray-700"
+            title="Clear saved session data"
+          >
+            Clear Cache
+          </button>
+        </div>
         {currentFile && (
           <div className="flex items-center gap-4">
             <span className="text-sm text-gray-600">
@@ -188,6 +286,25 @@ function App() {
           </div>
         )}
       </header>
+
+      {/* Restore notification */}
+      {restoreNotification && (
+        <div className="fixed top-4 right-4 bg-yellow-100 border border-yellow-400 text-yellow-700 px-4 py-2 rounded shadow-lg z-50">
+          {restoreNotification}
+        </div>
+      )}
+
+      {/* Join Wizard Modal */}
+      {showJoinWizard && (
+        <JoinWizard
+          loadedFiles={loadedFiles}
+          onFileUpload={loadFile}
+          executeQuery={executeQuery}
+          createJoinedTable={createJoinedTable}
+          onComplete={handleJoinComplete}
+          onCancel={() => setShowJoinWizard(false)}
+        />
+      )}
 
       {/* Main content */}
       <main className="flex-1 flex flex-col overflow-hidden p-4 gap-4">

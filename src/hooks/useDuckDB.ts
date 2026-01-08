@@ -2,7 +2,7 @@ import { useState, useEffect, useCallback, useRef } from 'react';
 import * as duckdb from '@duckdb/duckdb-wasm';
 import duckdb_wasm from '@duckdb/duckdb-wasm/dist/duckdb-mvp.wasm?url';
 import duckdb_worker from '@duckdb/duckdb-wasm/dist/duckdb-browser-mvp.worker.js?url';
-import type { QueryResult, ColumnInfo, LoadedFile, FileFormat } from '../types';
+import type { QueryResult, ColumnInfo, LoadedFile, FileFormat, JoinConfig } from '../types';
 import * as XLSX from 'xlsx';
 
 function detectFormat(filename: string): FileFormat {
@@ -130,6 +130,142 @@ export function useDuckDB() {
     return loadedFile;
   }, [db, conn]);
 
+  // Load file from text/buffer content (for restoring from IndexedDB)
+  const loadFileFromContent = useCallback(async (
+    content: string,
+    filename: string,
+    format: FileFormat
+  ): Promise<LoadedFile> => {
+    if (!db || !conn) throw new Error('Database not initialized');
+
+    const tableName = sanitizeTableName(filename);
+
+    // Drop table if exists
+    await conn.query(`DROP TABLE IF EXISTS "${tableName}"`);
+
+    if (format === 'xlsx' || format === 'xls') {
+      // Handle Excel files - content is base64 encoded
+      const binary = atob(content);
+      const bytes = new Uint8Array(binary.length);
+      for (let i = 0; i < binary.length; i++) {
+        bytes[i] = binary.charCodeAt(i);
+      }
+      const workbook = XLSX.read(bytes, { type: 'array' });
+      const firstSheet = workbook.Sheets[workbook.SheetNames[0]];
+      const csvData = XLSX.utils.sheet_to_csv(firstSheet);
+      await db.registerFileText(`${tableName}.csv`, csvData);
+      await conn.query(`CREATE TABLE "${tableName}" AS SELECT * FROM read_csv_auto('${tableName}.csv')`);
+    } else if (format === 'csv' || format === 'tsv') {
+      await db.registerFileText(filename, content);
+      const delimiter = format === 'tsv' ? '\t' : ',';
+      await conn.query(`CREATE TABLE "${tableName}" AS SELECT * FROM read_csv_auto('${filename}', delim='${delimiter}')`);
+    } else if (format === 'parquet') {
+      // Content is base64 encoded
+      const binary = atob(content);
+      const bytes = new Uint8Array(binary.length);
+      for (let i = 0; i < binary.length; i++) {
+        bytes[i] = binary.charCodeAt(i);
+      }
+      await db.registerFileBuffer(filename, bytes);
+      await conn.query(`CREATE TABLE "${tableName}" AS SELECT * FROM read_parquet('${filename}')`);
+    } else if (format === 'json') {
+      await db.registerFileText(filename, content);
+      await conn.query(`CREATE TABLE "${tableName}" AS SELECT * FROM read_json_auto('${filename}')`);
+    }
+
+    // Get table info
+    const schemaResult = await conn.query(`DESCRIBE "${tableName}"`);
+    const columns: ColumnInfo[] = [];
+    for (let i = 0; i < schemaResult.numRows; i++) {
+      columns.push({
+        name: schemaResult.getChild('column_name')?.get(i) as string,
+        type: schemaResult.getChild('column_type')?.get(i) as string,
+      });
+    }
+
+    const countResult = await conn.query(`SELECT COUNT(*) as cnt FROM "${tableName}"`);
+    const rowCount = Number(countResult.getChild('cnt')?.get(0) ?? 0);
+
+    const loadedFile: LoadedFile = {
+      name: filename,
+      tableName,
+      format,
+      columns,
+      rowCount,
+    };
+
+    setLoadedFiles(prev => [...prev.filter(f => f.tableName !== tableName), loadedFile]);
+
+    return loadedFile;
+  }, [db, conn]);
+
+  // Create a joined table from two tables
+  const createJoinedTable = useCallback(async (
+    config: JoinConfig,
+    newTableName: string
+  ): Promise<LoadedFile> => {
+    if (!conn) throw new Error('Database not initialized');
+
+    const sanitizedName = sanitizeTableName(newTableName);
+
+    // Build column selection with aliases for duplicates
+    const columnSelections: string[] = [];
+    for (const col of config.selectedColumns) {
+      const tableAlias = col.table === 'left' ? 't1' : 't2';
+      const colName = `${tableAlias}."${col.column}"`;
+      if (col.alias) {
+        columnSelections.push(`${colName} AS "${col.alias}"`);
+      } else {
+        columnSelections.push(colName);
+      }
+    }
+
+    // Build join conditions
+    const conditions = config.joinConditions.map(cond =>
+      `t1."${cond.leftColumn}" ${cond.operator} t2."${cond.rightColumn}"`
+    ).join(' AND ');
+
+    // Map join type to SQL
+    const joinTypeSQL = config.joinType === 'FULL OUTER' ? 'FULL OUTER JOIN' : `${config.joinType} JOIN`;
+
+    // Build and execute the CREATE TABLE query
+    const sql = `
+      CREATE TABLE "${sanitizedName}" AS
+      SELECT ${columnSelections.join(', ')}
+      FROM "${config.leftTable.tableName}" t1
+      ${joinTypeSQL} "${config.rightTable.tableName}" t2
+      ON ${conditions}
+    `;
+
+    await conn.query(`DROP TABLE IF EXISTS "${sanitizedName}"`);
+    await conn.query(sql);
+
+    // Get table info
+    const schemaResult = await conn.query(`DESCRIBE "${sanitizedName}"`);
+    const columns: ColumnInfo[] = [];
+    for (let i = 0; i < schemaResult.numRows; i++) {
+      columns.push({
+        name: schemaResult.getChild('column_name')?.get(i) as string,
+        type: schemaResult.getChild('column_type')?.get(i) as string,
+      });
+    }
+
+    const countResult = await conn.query(`SELECT COUNT(*) as cnt FROM "${sanitizedName}"`);
+    const rowCount = Number(countResult.getChild('cnt')?.get(0) ?? 0);
+
+    const loadedFile: LoadedFile = {
+      name: `${newTableName}.joined`,
+      tableName: sanitizedName,
+      format: 'csv', // Joined tables are virtual
+      columns,
+      rowCount,
+    };
+
+    setLoadedFiles(prev => [...prev.filter(f => f.tableName !== sanitizedName), loadedFile]);
+
+    return loadedFile;
+  }, [conn]);
+
   const exportData = useCallback(async (
     sql: string,
     format: FileFormat,
@@ -189,6 +325,8 @@ export function useDuckDB() {
     loadedFiles,
     executeQuery,
     loadFile,
+    loadFileFromContent,
+    createJoinedTable,
     exportData,
     downloadBlob,
   };
