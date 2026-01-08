@@ -7,6 +7,9 @@ import type { QueryResult } from '../types';
 // Register AG Grid modules
 ModuleRegistry.registerModules([AllCommunityModule]);
 
+// Custom theme
+const customTheme = themeQuartz;
+
 interface DataGridProps {
   data: QueryResult | null;
   onCellChange?: (rowIndex: number, field: string, oldValue: unknown, newValue: unknown) => void;
@@ -28,13 +31,13 @@ export function DataGrid({ data, onCellChange, quickFilterText }: DataGridProps)
       resizable: true,
       editable: true,
       floatingFilter: true,
-      minWidth: 100,
+      minWidth: 150,
+      width: 200,
     }));
   }, [data?.columns]);
 
   const defaultColDef = useMemo<ColDef>(() => ({
-    flex: 1,
-    minWidth: 100,
+    minWidth: 150,
     filter: true,
     sortable: true,
     resizable: true,
@@ -62,7 +65,7 @@ export function DataGrid({ data, onCellChange, quickFilterText }: DataGridProps)
     <div className="w-full flex-1" style={{ height: '100%', minHeight: '400px' }}>
       <AgGridReact
         ref={gridRef}
-        theme={themeQuartz}
+        theme={customTheme}
         rowData={data.rows}
         columnDefs={columnDefs}
         defaultColDef={defaultColDef}
