@@ -1,4 +1,4 @@
-import { useState, useMemo } from 'react';
+import { useState, useMemo, useEffect, useCallback } from 'react';
 import type { LoadedFile, JoinType, JoinCondition, SelectedColumn } from '../../types';
 import { JoinDiagram } from './JoinDiagram';
 
@@ -32,26 +32,59 @@ export function JoinConfigurator({
   const [conditions, setConditions] = useState<JoinCondition[]>([
     { leftColumn: leftTable.columns[0]?.name || '', rightColumn: rightTable.columns[0]?.name || '', operator: '=' },
   ]);
+  const [leftPrefix, setLeftPrefix] = useState('');
+  const [rightPrefix, setRightPrefix] = useState('');
+
+  // Helper to compute alias for a column based on prefix and conflict detection
+  const getColumnAlias = useCallback((
+    table: 'left' | 'right',
+    columnName: string,
+    lPrefix: string,
+    rPrefix: string
+  ): string | undefined => {
+    if (table === 'left') {
+      return lPrefix ? `${lPrefix}${columnName}` : undefined;
+    } else {
+      // Right table: apply prefix if set, otherwise alias only if conflicts with left
+      if (rPrefix) {
+        return `${rPrefix}${columnName}`;
+      }
+      const needsAlias = leftTable.columns.some(lc => lc.name === columnName);
+      return needsAlias ? `${rightTable.tableName}_${columnName}` : undefined;
+    }
+  }, [leftTable.columns, rightTable.tableName]);
 
   // Initialize with all columns selected
   const initialColumns: SelectedColumn[] = useMemo(() => {
     const cols: SelectedColumn[] = [];
     leftTable.columns.forEach(col => {
-      cols.push({ table: 'left', column: col.name });
+      cols.push({
+        table: 'left',
+        column: col.name,
+        alias: getColumnAlias('left', col.name, leftPrefix, rightPrefix),
+      });
     });
     rightTable.columns.forEach(col => {
-      // Add alias if column name exists in left table
-      const needsAlias = leftTable.columns.some(lc => lc.name === col.name);
       cols.push({
         table: 'right',
         column: col.name,
-        alias: needsAlias ? `${rightTable.tableName}_${col.name}` : undefined,
+        alias: getColumnAlias('right', col.name, leftPrefix, rightPrefix),
       });
     });
     return cols;
-  }, [leftTable, rightTable]);
+  }, [leftTable, rightTable, leftPrefix, rightPrefix, getColumnAlias]);
 
   const [selectedColumns, setSelectedColumns] = useState<SelectedColumn[]>(initialColumns);
+
+  // Update aliases when prefixes change
+  useEffect(() => {
+    setSelectedColumns(prev =>
+      prev.map(col => ({
+        ...col,
+        alias: getColumnAlias(col.table, col.column, leftPrefix, rightPrefix),
+      }))
+    );
+  }, [leftPrefix, rightPrefix, getColumnAlias]);
 
   const addCondition = () => {
     setConditions([
@@ -77,13 +110,12 @@ export function JoinConfigurator({
     if (existing) {
       setSelectedColumns(selectedColumns.filter(c => !(c.table === table && c.column === column)));
     } else {
-      const needsAlias = table === 'right' && leftTable.columns.some(lc => lc.name === column);
       setSelectedColumns([
         ...selectedColumns,
         {
           table,
           column,
-          alias: needsAlias ? `${rightTable.tableName}_${column}` : undefined,
+          alias: getColumnAlias(table, column, leftPrefix, rightPrefix),
         },
       ]);
     }
@@ -207,37 +239,61 @@ ${joinSQL} "${rightTable.tableName}" t2
       <div>
         <label className="block text-sm font-medium mb-2">Select Columns</label>
         <div className="grid grid-cols-2 gap-4">
-          <div className="border rounded p-2 max-h-40 overflow-y-auto">
+          <div className="border rounded p-2">
             <div className="text-xs text-blue-600 font-medium mb-1">Left Table (t1)</div>
-            {leftTable.columns.map(col => (
-              <label key={col.name} className="flex items-center gap-2 text-sm py-0.5">
-                <input
-                  type="checkbox"
-                  checked={isColumnSelected('left', col.name)}
-                  onChange={() => toggleColumn('left', col.name)}
-                />
-                <span className="truncate" title={`${col.name} (${col.type})`}>
-                  {col.name}
-                </span>
-                <span className="text-xs text-gray-400">{col.type}</span>
-              </label>
-            ))}
+            <div className="flex items-center gap-2 mb-2">
+              <label className="text-xs text-gray-500">Prefix:</label>
+              <input
+                type="text"
+                value={leftPrefix}
+                onChange={e => setLeftPrefix(e.target.value)}
+                placeholder="e.g. orders_"
+                className="flex-1 border rounded px-2 py-1 text-xs"
+              />
+            </div>
+            <div className="max-h-32 overflow-y-auto">
+              {leftTable.columns.map(col => (
+                <label key={col.name} className="flex items-center gap-2 text-sm py-0.5">
+                  <input
+                    type="checkbox"
+                    checked={isColumnSelected('left', col.name)}
+                    onChange={() => toggleColumn('left', col.name)}
+                  />
+                  <span className="truncate" title={`${col.name} (${col.type})`}>
+                    {col.name}
+                  </span>
+                  <span className="text-xs text-gray-400">{col.type}</span>
+                </label>
+              ))}
+            </div>
           </div>
-          <div className="border rounded p-2 max-h-40 overflow-y-auto">
+          <div className="border rounded p-2">
             <div className="text-xs text-green-600 font-medium mb-1">Right Table (t2)</div>
-            {rightTable.columns.map(col => (
-              <label key={col.name} className="flex items-center gap-2 text-sm py-0.5">
-                <input
-                  type="checkbox"
-                  checked={isColumnSelected('right', col.name)}
-                  onChange={() => toggleColumn('right', col.name)}
-                />
-                <span className="truncate" title={`${col.name} (${col.type})`}>
-                  {col.name}
-                </span>
-                <span className="text-xs text-gray-400">{col.type}</span>
-              </label>
-            ))}
+            <div className="flex items-center gap-2 mb-2">
+              <label className="text-xs text-gray-500">Prefix:</label>
+              <input
+                type="text"
+                value={rightPrefix}
+                onChange={e => setRightPrefix(e.target.value)}
+                placeholder="e.g. products_"
+                className="flex-1 border rounded px-2 py-1 text-xs"
+              />
+            </div>
+            <div className="max-h-32 overflow-y-auto">
+              {rightTable.columns.map(col => (
+                <label key={col.name} className="flex items-center gap-2 text-sm py-0.5">
+                  <input
+                    type="checkbox"
+                    checked={isColumnSelected('right', col.name)}
+                    onChange={() => toggleColumn('right', col.name)}
+                  />
+                  <span className="truncate" title={`${col.name} (${col.type})`}>
+                    {col.name}
+                  </span>
+                  <span className="text-xs text-gray-400">{col.type}</span>
+                </label>
+              ))}
+            </div>
           </div>
         </div>
       </div>
