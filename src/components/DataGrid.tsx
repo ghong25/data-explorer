@@ -1,4 +1,4 @@
-import { useMemo, useCallback, useRef, useState, useEffect } from 'react';
+import { useMemo, useCallback, useRef, useState, useEffect, forwardRef, useImperativeHandle } from 'react';
 import { AgGridReact } from 'ag-grid-react';
 import { AllCommunityModule, ModuleRegistry, themeQuartz } from 'ag-grid-community';
 import type { ColDef, GridApi, GridReadyEvent, CellValueChangedEvent } from 'ag-grid-community';
@@ -10,25 +10,38 @@ ModuleRegistry.registerModules([AllCommunityModule]);
 // Custom theme
 const customTheme = themeQuartz;
 
+export interface ExportParams {
+  visibleColumns: string[];
+  quickFilterText?: string;
+  filterModel?: Record<string, unknown>;
+}
+
+export interface DataGridHandle {
+  getDisplayedData: () => QueryResult | null;
+  getExportParams: () => ExportParams | null;
+}
+
 interface DataGridProps {
   data: QueryResult | null;
   onCellChange?: (rowIndex: number, field: string, oldValue: unknown, newValue: unknown) => void;
   quickFilterText?: string;
 }
 
-export function DataGrid({ data, onCellChange, quickFilterText }: DataGridProps) {
+export const DataGrid = forwardRef<DataGridHandle, DataGridProps>(function DataGrid({ data, onCellChange, quickFilterText }, ref) {
   const gridRef = useRef<AgGridReact>(null);
   const gridApiRef = useRef<GridApi | null>(null);
   const [showColumnSelector, setShowColumnSelector] = useState(false);
   const [showColumnCheckboxes, setShowColumnCheckboxes] = useState(false);
   const [visibleColumns, setVisibleColumns] = useState<Set<string>>(new Set());
+  const [columnOrder, setColumnOrder] = useState<string[]>([]);
   const columnSelectorRef = useRef<HTMLDivElement>(null);
   const checkboxRowRef = useRef<HTMLDivElement>(null);
 
-  // Initialize visible columns when data changes
+  // Initialize visible columns and column order when data changes
   useEffect(() => {
     if (data?.columns) {
       setVisibleColumns(new Set(data.columns));
+      setColumnOrder(data.columns);
     }
   }, [data?.columns.join(',')]);
 
@@ -44,9 +57,10 @@ export function DataGrid({ data, onCellChange, quickFilterText }: DataGridProps)
   }, []);
 
   const columnDefs = useMemo<ColDef[]>(() => {
-    if (!data || data.columns.length === 0) return [];
+    if (!data || columnOrder.length === 0) return [];
 
-    return data.columns
+    // Use columnOrder to preserve user's drag order
+    return columnOrder
       .filter(col => visibleColumns.has(col))
       .map((col) => ({
         field: col,
@@ -59,7 +73,7 @@ export function DataGrid({ data, onCellChange, quickFilterText }: DataGridProps)
         minWidth: 150,
         width: 200,
       }));
-  }, [data?.columns, visibleColumns]);
+  }, [data, columnOrder, visibleColumns]);
 
   const defaultColDef = useMemo<ColDef>(() => ({
     minWidth: 150,
@@ -71,6 +85,57 @@ export function DataGrid({ data, onCellChange, quickFilterText }: DataGridProps)
   const onGridReady = useCallback((params: GridReadyEvent) => {
     gridApiRef.current = params.api;
   }, []);
+
+  // Update column order when columns are dragged (but not on resize)
+  const onDragStopped = useCallback(() => {
+    if (!gridApiRef.current) return;
+    const colState = gridApiRef.current.getColumnState();
+    const newOrder = colState
+      .filter(col => col.colId && !col.hide)
+      .map(col => col.colId as string);
+
+    // Only update if order actually changed (not just a resize)
+    setColumnOrder(prev => {
+      if (prev.length !== newOrder.length) return newOrder;
+      for (let i = 0; i < prev.length; i++) {
+        if (prev[i] !== newOrder[i]) return newOrder;
+      }
+      return prev; // No change, keep same reference
+    });
+  }, []);
+
+  // Expose methods via ref
+  useImperativeHandle(ref, () => ({
+    getDisplayedData: (): QueryResult | null => {
+      if (!gridApiRef.current || !data) return null;
+
+      const displayedRows: Record<string, unknown>[] = [];
+      gridApiRef.current.forEachNodeAfterFilterAndSort((node) => {
+        if (node.data) {
+          const filteredRow: Record<string, unknown> = {};
+          for (const col of Array.from(visibleColumns)) {
+            filteredRow[col] = node.data[col];
+          }
+          displayedRows.push(filteredRow);
+        }
+      });
+
+      return {
+        columns: data.columns.filter(col => visibleColumns.has(col)),
+        rows: displayedRows,
+        rowCount: displayedRows.length,
+      };
+    },
+    getExportParams: (): ExportParams | null => {
+      if (!gridApiRef.current || !data) return null;
+
+      return {
+        visibleColumns: columnOrder.filter(col => visibleColumns.has(col)),
+        quickFilterText: quickFilterText || undefined,
+        filterModel: gridApiRef.current.getFilterModel() || undefined,
+      };
+    }
+  }), [data, visibleColumns, quickFilterText, columnOrder]);
 
   // Sync checkbox row scroll with grid scroll
   const onBodyScroll = useCallback(() => {
@@ -209,7 +274,7 @@ export function DataGrid({ data, onCellChange, quickFilterText }: DataGridProps)
           className="flex border-b bg-gray-50 mb-1 overflow-x-auto"
           style={{ scrollbarWidth: 'none', msOverflowStyle: 'none' }}
         >
-          {data.columns
+          {columnOrder
             .filter(col => visibleColumns.has(col))
             .map(col => (
               <div
@@ -244,6 +309,7 @@ export function DataGrid({ data, onCellChange, quickFilterText }: DataGridProps)
           onGridReady={onGridReady}
           onCellValueChanged={onCellValueChanged}
           onBodyScroll={onBodyScroll}
+          onDragStopped={onDragStopped}
           quickFilterText={quickFilterText}
           pagination={true}
           paginationPageSize={100}
@@ -251,8 +317,9 @@ export function DataGrid({ data, onCellChange, quickFilterText }: DataGridProps)
           enableCellTextSelection={true}
           animateRows={true}
           suppressMenuHide={true}
+          maintainColumnOrder={true}
         />
       </div>
     </div>
   );
-}
+});

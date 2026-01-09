@@ -1,4 +1,4 @@
-import { useState, useCallback } from 'react';
+import { useState, useCallback, useEffect } from 'react';
 import type { FileFormat } from '../types';
 
 interface ExportPanelProps {
@@ -18,6 +18,11 @@ const FORMAT_OPTIONS: { value: FileFormat; label: string; extension: string }[] 
 export function ExportPanel({ onExport, isExporting, defaultFilename = 'export' }: ExportPanelProps) {
   const [format, setFormat] = useState<FileFormat>('csv');
   const [filename, setFilename] = useState(defaultFilename);
+
+  // Sync filename when defaultFilename prop changes (e.g., switching tables)
+  useEffect(() => {
+    setFilename(defaultFilename);
+  }, [defaultFilename]);
 
   const handleExport = useCallback(() => {
     const ext = FORMAT_OPTIONS.find(f => f.value === format)?.extension || '';

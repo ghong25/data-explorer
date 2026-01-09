@@ -2,7 +2,7 @@ import { useState, useCallback } from 'react';
 
 interface RegexSearchProps {
   columns: string[];
-  onSearch: (pattern: string, column: string | null, useRegex: boolean) => void;
+  onSearch: (pattern: string, column: string | null, useRegex: boolean, caseSensitive: boolean) => void;
   onClear: () => void;
 }
 
@@ -10,6 +10,7 @@ export function RegexSearch({ columns, onSearch, onClear }: RegexSearchProps) {
   const [pattern, setPattern] = useState('');
   const [selectedColumn, setSelectedColumn] = useState<string>('');
   const [useRegex, setUseRegex] = useState(false);
+  const [caseSensitive, setCaseSensitive] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
   const handleSearch = useCallback(() => {
@@ -29,8 +30,8 @@ export function RegexSearch({ columns, onSearch, onClear }: RegexSearchProps) {
       }
     }
 
-    onSearch(pattern, selectedColumn || null, useRegex);
-  }, [pattern, selectedColumn, useRegex, onSearch, onClear]);
+    onSearch(pattern, selectedColumn || null, useRegex, caseSensitive);
+  }, [pattern, selectedColumn, useRegex, caseSensitive, onSearch, onClear]);
 
   const handleKeyDown = useCallback((e: React.KeyboardEvent) => {
     if (e.key === 'Enter') {
@@ -74,6 +75,15 @@ export function RegexSearch({ columns, onSearch, onClear }: RegexSearchProps) {
             className="rounded"
           />
           Regex
+        </label>
+        <label className="flex items-center gap-1 text-sm text-gray-600">
+          <input
+            type="checkbox"
+            checked={caseSensitive}
+            onChange={(e) => setCaseSensitive(e.target.checked)}
+            className="rounded"
+          />
+          Case sensitive
         </label>
         <button
           onClick={handleSearch}

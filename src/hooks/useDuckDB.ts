@@ -308,6 +308,161 @@ export function useDuckDB() {
     return blob;
   }, [conn, db, executeQuery]);
 
+  // Export data directly from a QueryResult (for filtered/visible data export)
+  const exportFromData = useCallback(async (
+    data: { columns: string[]; rows: Record<string, unknown>[] },
+    format: FileFormat,
+  ): Promise<Blob> => {
+    if (format === 'json') {
+      return new Blob([JSON.stringify(data.rows, null, 2)], { type: 'application/json' });
+    }
+
+    if (format === 'xlsx' || format === 'xls') {
+      const ws = XLSX.utils.json_to_sheet(data.rows, { header: data.columns });
+      const wb = XLSX.utils.book_new();
+      XLSX.utils.book_append_sheet(wb, ws, 'Data');
+      const buffer = XLSX.write(wb, { bookType: format === 'xlsx' ? 'xlsx' : 'xls', type: 'array' });
+      return new Blob([buffer], { type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' });
+    }
+
+    if (format === 'csv' || format === 'tsv') {
+      const delimiter = format === 'tsv' ? '\t' : ',';
+      const escapeField = (val: unknown): string => {
+        const str = val === null || val === undefined ? '' : String(val);
+        if (str.includes(delimiter) || str.includes('"') || str.includes('\n')) {
+          return `"${str.replace(/"/g, '""')}"`;
+        }
+        return str;
+      };
+      const header = data.columns.map(escapeField).join(delimiter);
+      const rows = data.rows.map(row =>
+        data.columns.map(col => escapeField(row[col])).join(delimiter)
+      );
+      const content = [header, ...rows].join('\n');
+      return new Blob([content], { type: 'text/plain' });
+    }
+
+    if (format === 'parquet') {
+      // For parquet, we need to use DuckDB - create temp table from data
+      if (!conn) throw new Error('Database not initialized');
+      const tempTable = `_export_${Date.now()}`;
+
+      // Create table with columns
+      const colDefs = data.columns.map(col => `"${col}" VARCHAR`).join(', ');
+      await conn.query(`CREATE TEMP TABLE ${tempTable} (${colDefs})`);
+
+      // Insert data
+      for (const row of data.rows) {
+        const values = data.columns.map(col => {
+          const val = row[col];
+          if (val === null || val === undefined) return 'NULL';
+          return `'${String(val).replace(/'/g, "''")}'`;
+        }).join(', ');
+        await conn.query(`INSERT INTO ${tempTable} VALUES (${values})`);
+      }
+
+      const exportFile = `${tempTable}.parquet`;
+      await conn.query(`COPY ${tempTable} TO '${exportFile}' (FORMAT PARQUET)`);
+      const buffer = await db!.copyFileToBuffer(exportFile);
+      await conn.query(`DROP TABLE ${tempTable}`);
+
+      return new Blob([new Uint8Array(buffer).buffer as ArrayBuffer], { type: 'application/octet-stream' });
+    }
+
+    throw new Error(`Unsupported export format: ${format}`);
+  }, [conn, db]);
+
+  // Export with filters - builds SQL query from export params
+  const exportWithFilters = useCallback(async (
+    tableName: string,
+    visibleColumns: string[],
+    format: FileFormat,
+    quickFilterText?: string,
+    filterModel?: Record<string, unknown>,
+  ): Promise<Blob> => {
+    if (!conn || !db) throw new Error('Database not initialized');
+
+    // Build column selection
+    const columns = visibleColumns.map(col => `"${col}"`).join(', ');
+
+    // Build WHERE clause from filters
+    const whereClauses: string[] = [];
+
+    // Quick filter - search across all visible columns
+    if (quickFilterText && quickFilterText.trim()) {
+      const searchTerm = quickFilterText.trim().replace(/'/g, "''");
+      const orClauses = visibleColumns.map(col =>
+        `CAST("${col}" AS VARCHAR) ILIKE '%${searchTerm}%'`
+      );
+      whereClauses.push(`(${orClauses.join(' OR ')})`);
+    }
+
+    // Column filters from AG Grid filter model
+    if (filterModel && Object.keys(filterModel).length > 0) {
+      for (const [column, filter] of Object.entries(filterModel)) {
+        const f = filter as { type?: string; filter?: string | number; filterTo?: number; filterType?: string };
+        if (f.filterType === 'text' && f.filter) {
+          const value = String(f.filter).replace(/'/g, "''");
+          switch (f.type) {
+            case 'contains':
+              whereClauses.push(`CAST("${column}" AS VARCHAR) ILIKE '%${value}%'`);
+              break;
+            case 'notContains':
+              whereClauses.push(`CAST("${column}" AS VARCHAR) NOT ILIKE '%${value}%'`);
+              break;
+            case 'equals':
+              whereClauses.push(`CAST("${column}" AS VARCHAR) = '${value}'`);
+              break;
+            case 'notEqual':
+              whereClauses.push(`CAST("${column}" AS VARCHAR) != '${value}'`);
+              break;
+            case 'startsWith':
+              whereClauses.push(`CAST("${column}" AS VARCHAR) ILIKE '${value}%'`);
+              break;
+            case 'endsWith':
+              whereClauses.push(`CAST("${column}" AS VARCHAR) ILIKE '%${value}'`);
+              break;
+            default:
+              whereClauses.push(`CAST("${column}" AS VARCHAR) ILIKE '%${value}%'`);
+          }
+        } else if (f.filterType === 'number' && f.filter !== undefined) {
+          switch (f.type) {
+            case 'equals':
+              whereClauses.push(`"${column}" = ${f.filter}`);
+              break;
+            case 'notEqual':
+              whereClauses.push(`"${column}" != ${f.filter}`);
+              break;
+            case 'greaterThan':
+              whereClauses.push(`"${column}" > ${f.filter}`);
+              break;
+            case 'greaterThanOrEqual':
+              whereClauses.push(`"${column}" >= ${f.filter}`);
+              break;
+            case 'lessThan':
+              whereClauses.push(`"${column}" < ${f.filter}`);
+              break;
+            case 'lessThanOrEqual':
+              whereClauses.push(`"${column}" <= ${f.filter}`);
+              break;
+            case 'inRange':
+              if (f.filterTo !== undefined) {
+                whereClauses.push(`"${column}" BETWEEN ${f.filter} AND ${f.filterTo}`);
+              }
+              break;
+          }
+        }
+      }
+    }
+
+    // Build final query
+    const whereClause = whereClauses.length > 0 ? `WHERE ${whereClauses.join(' AND ')}` : '';
+    const sql = `SELECT ${columns} FROM "${tableName}" ${whereClause}`;
+
+    // Use existing exportData function with the built query
+    return exportData(sql, format, '');
+  }, [conn, db, exportData]);
+
   const downloadBlob = useCallback((blob: Blob, filename: string) => {
     const url = URL.createObjectURL(blob);
     const a = document.createElement('a');
@@ -328,6 +483,8 @@ export function useDuckDB() {
     loadFileFromContent,
     createJoinedTable,
     exportData,
+    exportFromData,
+    exportWithFilters,
     downloadBlob,
   };
 }

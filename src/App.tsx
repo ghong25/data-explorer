@@ -1,8 +1,8 @@
-import { useState, useCallback, useMemo, useEffect } from 'react';
+import { useState, useCallback, useMemo, useEffect, useRef } from 'react';
 import { useDuckDB } from './hooks/useDuckDB';
 import { useFilePersistence } from './hooks/useFilePersistence';
 import { FileDropZone } from './components/FileDropZone';
-import { DataGrid } from './components/DataGrid';
+import { DataGrid, type DataGridHandle } from './components/DataGrid';
 import { SqlEditor } from './components/SqlEditor';
 import { RegexSearch } from './components/RegexSearch';
 import { ExportPanel } from './components/ExportPanel';
@@ -22,6 +22,7 @@ function App() {
     loadFileFromContent,
     createJoinedTable,
     exportData,
+    exportWithFilters,
     downloadBlob,
   } = useDuckDB();
 
@@ -43,6 +44,7 @@ function App() {
   const [showJoinWizard, setShowJoinWizard] = useState(false);
   const [restoreNotification, setRestoreNotification] = useState<string | null>(null);
   const [isRestoring, setIsRestoring] = useState(false);
+  const dataGridRef = useRef<DataGridHandle>(null);
 
   // Auto-restore last used file on mount
   useEffect(() => {
@@ -140,25 +142,29 @@ function App() {
     }
   }, [executeQuery]);
 
-  const handleSearch = useCallback(async (pattern: string, column: string | null, useRegex: boolean) => {
+  const handleSearch = useCallback(async (pattern: string, column: string | null, useRegex: boolean, caseSensitive: boolean) => {
     if (!currentFile) return;
 
     setIsQueryRunning(true);
     setError(null);
     try {
+      const escapedPattern = pattern.replace(/'/g, "''");
+      const likeOp = caseSensitive ? 'LIKE' : 'ILIKE';
+      const regexFlags = caseSensitive ? '' : ", 'i'";
+
       let whereClause: string;
       if (column) {
         if (useRegex) {
-          whereClause = `regexp_matches(CAST("${column}" AS VARCHAR), '${pattern.replace(/'/g, "''")}')`;
+          whereClause = `regexp_matches(CAST("${column}" AS VARCHAR), '${escapedPattern}'${regexFlags})`;
         } else {
-          whereClause = `CAST("${column}" AS VARCHAR) LIKE '%${pattern.replace(/'/g, "''")}%'`;
+          whereClause = `CAST("${column}" AS VARCHAR) ${likeOp} '%${escapedPattern}%'`;
         }
       } else {
         const conditions = currentFile.columns.map(col => {
           if (useRegex) {
-            return `regexp_matches(CAST("${col.name}" AS VARCHAR), '${pattern.replace(/'/g, "''")}')`;
+            return `regexp_matches(CAST("${col.name}" AS VARCHAR), '${escapedPattern}'${regexFlags})`;
           } else {
-            return `CAST("${col.name}" AS VARCHAR) LIKE '%${pattern.replace(/'/g, "''")}%'`;
+            return `CAST("${col.name}" AS VARCHAR) ${likeOp} '%${escapedPattern}%'`;
           }
         });
         whereClause = conditions.join(' OR ');
@@ -189,19 +195,36 @@ function App() {
   }, [currentFile, executeQuery]);
 
   const handleExport = useCallback(async (format: FileFormat, filename: string) => {
-    if (!lastQuery) return;
+    if (!currentFile) return;
 
     setIsExporting(true);
     setError(null);
     try {
-      const blob = await exportData(lastQuery, format, filename);
+      let blob: Blob;
+      // Get export params from grid (visible columns, filters)
+      const exportParams = dataGridRef.current?.getExportParams();
+      if (exportParams && exportParams.visibleColumns.length > 0) {
+        // Export all rows matching filters (no LIMIT)
+        blob = await exportWithFilters(
+          currentFile.tableName,
+          exportParams.visibleColumns,
+          format,
+          exportParams.quickFilterText,
+          exportParams.filterModel,
+        );
+      } else if (lastQuery) {
+        // Fall back to full query export
+        blob = await exportData(lastQuery, format, filename);
+      } else {
+        throw new Error('No data to export');
+      }
       downloadBlob(blob, filename);
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Export failed');
     } finally {
       setIsExporting(false);
     }
-  }, [lastQuery, exportData, downloadBlob]);
+  }, [currentFile, lastQuery, exportData, exportWithFilters, downloadBlob]);
 
   const columns = useMemo(() => {
     return queryResult?.columns || [];
@@ -367,7 +390,10 @@ function App() {
                   className="px-3 py-2 border rounded text-sm focus:outline-none focus:ring-2 focus:ring-blue-500 w-48"
                 />
                 <button
-                  onClick={() => {
+                  type="button"
+                  onClick={(e) => {
+                    e.preventDefault();
+                    e.stopPropagation();
                     setCurrentFile(null);
                     setQueryResult(null);
                     setLastQuery('');
@@ -390,12 +416,12 @@ function App() {
                   />
                 </div>
                 <div className="w-1/2 flex flex-col min-h-0 overflow-hidden">
-                  <DataGrid data={queryResult} quickFilterText={quickFilter} />
+                  <DataGrid ref={dataGridRef} data={queryResult} quickFilterText={quickFilter} />
                 </div>
               </div>
             ) : (
               <div className="flex-1 min-h-0 overflow-hidden">
-                <DataGrid data={queryResult} quickFilterText={quickFilter} />
+                <DataGrid ref={dataGridRef} data={queryResult} quickFilterText={quickFilter} />
               </div>
             )}
 
