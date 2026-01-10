@@ -109,11 +109,13 @@ export const DataGrid = forwardRef<DataGridHandle, DataGridProps>(function DataG
     getDisplayedData: (): QueryResult | null => {
       if (!gridApiRef.current || !data) return null;
 
+      // Use columnOrder to preserve user's drag-and-drop order
+      const orderedVisibleColumns = columnOrder.filter(col => visibleColumns.has(col));
       const displayedRows: Record<string, unknown>[] = [];
       gridApiRef.current.forEachNodeAfterFilterAndSort((node) => {
         if (node.data) {
           const filteredRow: Record<string, unknown> = {};
-          for (const col of Array.from(visibleColumns)) {
+          for (const col of orderedVisibleColumns) {
             filteredRow[col] = node.data[col];
           }
           displayedRows.push(filteredRow);
@@ -121,7 +123,7 @@ export const DataGrid = forwardRef<DataGridHandle, DataGridProps>(function DataG
       });
 
       return {
-        columns: data.columns.filter(col => visibleColumns.has(col)),
+        columns: orderedVisibleColumns,
         rows: displayedRows,
         rowCount: displayedRows.length,
       };
@@ -147,10 +149,8 @@ export const DataGrid = forwardRef<DataGridHandle, DataGridProps>(function DataG
 
   // Sync grid scroll when checkbox row is scrolled
   const onCheckboxRowScroll = useCallback(() => {
-    if (checkboxRowRef.current && gridApiRef.current) {
+    if (checkboxRowRef.current) {
       const scrollLeft = checkboxRowRef.current.scrollLeft;
-      gridApiRef.current.setGridOption('scrollbarWidth', undefined); // Force refresh
-      // Use the viewport to scroll
       const viewport = document.querySelector('.ag-body-horizontal-scroll-viewport') as HTMLElement;
       if (viewport) {
         viewport.scrollLeft = scrollLeft;

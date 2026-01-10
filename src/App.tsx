@@ -21,8 +21,7 @@ function App() {
     loadFile,
     loadFileFromContent,
     createJoinedTable,
-    exportData,
-    exportWithFilters,
+    exportFromData,
     downloadBlob,
   } = useDuckDB();
 
@@ -45,10 +44,12 @@ function App() {
   const [restoreNotification, setRestoreNotification] = useState<string | null>(null);
   const [isRestoring, setIsRestoring] = useState(false);
   const dataGridRef = useRef<DataGridHandle>(null);
+  const hasAttemptedRestore = useRef(false);
 
-  // Auto-restore last used file on mount
+  // Auto-restore last used file on mount (only once)
   useEffect(() => {
-    if (dbLoading || currentFile) return;
+    if (dbLoading || hasAttemptedRestore.current) return;
+    hasAttemptedRestore.current = true;
 
     const restoreLastFile = async () => {
       try {
@@ -83,7 +84,7 @@ function App() {
     };
 
     restoreLastFile();
-  }, [dbLoading, currentFile, getLastUsedFileId, loadFileFromContent, executeQuery]);
+  }, [dbLoading, getLastUsedFileId, loadFileFromContent, executeQuery]);
 
   const handleFileSelect = useCallback(async (file: File) => {
     setIsFileLoading(true);
@@ -200,31 +201,19 @@ function App() {
     setIsExporting(true);
     setError(null);
     try {
-      let blob: Blob;
-      // Get export params from grid (visible columns, filters)
-      const exportParams = dataGridRef.current?.getExportParams();
-      if (exportParams && exportParams.visibleColumns.length > 0) {
-        // Export all rows matching filters (no LIMIT)
-        blob = await exportWithFilters(
-          currentFile.tableName,
-          exportParams.visibleColumns,
-          format,
-          exportParams.quickFilterText,
-          exportParams.filterModel,
-        );
-      } else if (lastQuery) {
-        // Fall back to full query export
-        blob = await exportData(lastQuery, format, filename);
-      } else {
+      // Get displayed data from grid (includes edits, filters, and column visibility)
+      const displayedData = dataGridRef.current?.getDisplayedData();
+      if (!displayedData || displayedData.rows.length === 0) {
         throw new Error('No data to export');
       }
+      const blob = await exportFromData(displayedData, format);
       downloadBlob(blob, filename);
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Export failed');
     } finally {
       setIsExporting(false);
     }
-  }, [currentFile, lastQuery, exportData, exportWithFilters, downloadBlob]);
+  }, [currentFile, exportFromData, downloadBlob]);
 
   const columns = useMemo(() => {
     return queryResult?.columns || [];
