@@ -1,4 +1,29 @@
-# React + TypeScript + Vite
+# Data Explorer
+
+A React + TypeScript + Vite application for exploring and analyzing data using DuckDB WASM.
+
+## Quick Start
+
+```bash
+# Install dependencies
+npm install
+
+# Start development server
+npm run dev
+```
+
+The app will be available at `http://localhost:5173`.
+
+## Available Scripts
+
+- `npm run dev` - Start development server
+- `npm run build` - Build for production
+- `npm run preview` - Preview production build
+- `npm run lint` - Run ESLint
+
+---
+
+## Vite Configuration
 
 This template provides a minimal setup to get React working in Vite with HMR and some ESLint rules.
 
