@@ -7,8 +7,9 @@ import { SqlEditor } from './components/SqlEditor';
 import { RegexSearch } from './components/RegexSearch';
 import { ExportPanel } from './components/ExportPanel';
 import { JoinWizard } from './components/JoinWizard';
+import { TabBar } from './components/TabBar';
 import { getPersistedFile } from './utils/indexedDB';
-import type { QueryResult, FileFormat, LoadedFile } from './types';
+import type { FileFormat, LoadedFile, FileTabState } from './types';
 
 type ViewMode = 'data' | 'sql';
 
@@ -31,20 +32,74 @@ function App() {
     clearSavedData,
   } = useFilePersistence();
 
-  const [currentFile, setCurrentFile] = useState<LoadedFile | null>(null);
+  // Tab-based state
+  const [tabs, setTabs] = useState<FileTabState[]>([]);
+  const [activeTabId, setActiveTabId] = useState<string | null>(null);
+  const [showFileSelector, setShowFileSelector] = useState(false);
+
+  // Derived state from active tab
+  const activeTab = useMemo(() =>
+    tabs.find(t => t.file.tableName === activeTabId) ?? null,
+    [tabs, activeTabId]
+  );
+  const currentFile = activeTab?.file ?? null;
+  const queryResult = activeTab?.queryResult ?? null;
+  const lastQuery = activeTab?.lastQuery ?? '';
+  const quickFilter = activeTab?.quickFilter ?? '';
+
   const [viewMode, setViewMode] = useState<ViewMode>('data');
-  const [queryResult, setQueryResult] = useState<QueryResult | null>(null);
-  const [lastQuery, setLastQuery] = useState<string>('');
   const [isFileLoading, setIsFileLoading] = useState(false);
   const [isQueryRunning, setIsQueryRunning] = useState(false);
   const [isExporting, setIsExporting] = useState(false);
-  const [quickFilter, setQuickFilter] = useState('');
   const [error, setError] = useState<string | null>(null);
   const [showJoinWizard, setShowJoinWizard] = useState(false);
   const [restoreNotification, setRestoreNotification] = useState<string | null>(null);
   const [isRestoring, setIsRestoring] = useState(false);
   const dataGridRef = useRef<DataGridHandle>(null);
   const hasAttemptedRestore = useRef(false);
+
+  // Helper to update a specific tab's state
+  const updateTab = useCallback((tableName: string, updates: Partial<FileTabState>) => {
+    setTabs(prev => prev.map(tab =>
+      tab.file.tableName === tableName
+        ? { ...tab, ...updates }
+        : tab
+    ));
+  }, []);
+
+  // Save current tab's filter state before switching
+  const saveCurrentTabState = useCallback(() => {
+    if (!activeTabId || !dataGridRef.current) return;
+    const filterModel = dataGridRef.current.getFilterModel?.() ?? null;
+    updateTab(activeTabId, { filterModel });
+  }, [activeTabId, updateTab]);
+
+  // Switch to a different tab
+  const handleTabSelect = useCallback((tableName: string) => {
+    saveCurrentTabState();
+    setActiveTabId(tableName);
+    setShowFileSelector(false);
+  }, [saveCurrentTabState]);
+
+  // Close a tab
+  const handleTabClose = useCallback((tableName: string) => {
+    setTabs(prev => {
+      const newTabs = prev.filter(t => t.file.tableName !== tableName);
+      if (tableName === activeTabId && newTabs.length > 0) {
+        setActiveTabId(newTabs[newTabs.length - 1].file.tableName);
+      } else if (newTabs.length === 0) {
+        setActiveTabId(null);
+      }
+      return newTabs;
+    });
+  }, [activeTabId]);
+
+  // Update quickFilter for active tab
+  const setQuickFilter = useCallback((value: string) => {
+    if (activeTabId) {
+      updateTab(activeTabId, { quickFilter: value });
+    }
+  }, [activeTabId, updateTab]);
 
   // Auto-restore last used file on mount (only once)
   useEffect(() => {
@@ -70,10 +125,19 @@ function App() {
           persisted.name,
           persisted.format
         );
-        setCurrentFile(loaded);
         const result = await executeQuery(`SELECT * FROM "${loaded.tableName}" LIMIT 1000`);
-        setQueryResult(result);
-        setLastQuery(`SELECT * FROM "${loaded.tableName}"`);
+        const defaultQuery = `SELECT * FROM "${loaded.tableName}"`;
+
+        // Create new tab for restored file
+        const newTab: FileTabState = {
+          file: loaded,
+          queryResult: result,
+          lastQuery: defaultQuery,
+          quickFilter: '',
+          filterModel: null,
+        };
+        setTabs([newTab]);
+        setActiveTabId(loaded.tableName);
       } catch (err) {
         console.error('Failed to restore file:', err);
         setRestoreNotification('Previous session could not be restored');
@@ -89,12 +153,23 @@ function App() {
   const handleFileSelect = useCallback(async (file: File) => {
     setIsFileLoading(true);
     setError(null);
+    setShowFileSelector(false);
     try {
       const loaded = await loadFile(file);
-      setCurrentFile(loaded);
       const result = await executeQuery(`SELECT * FROM "${loaded.tableName}" LIMIT 1000`);
-      setQueryResult(result);
-      setLastQuery(`SELECT * FROM "${loaded.tableName}"`);
+      const defaultQuery = `SELECT * FROM "${loaded.tableName}"`;
+
+      // Create new tab
+      const newTab: FileTabState = {
+        file: loaded,
+        queryResult: result,
+        lastQuery: defaultQuery,
+        quickFilter: '',
+        filterModel: null,
+      };
+
+      setTabs(prev => [...prev, newTab]);
+      setActiveTabId(loaded.tableName);
       setViewMode('data');
 
       // Save to persistence for auto-restore on next visit
@@ -112,10 +187,20 @@ function App() {
 
   const handleJoinComplete = useCallback(async (result: LoadedFile) => {
     setShowJoinWizard(false);
-    setCurrentFile(result);
-    const queryResult = await executeQuery(`SELECT * FROM "${result.tableName}" LIMIT 1000`);
-    setQueryResult(queryResult);
-    setLastQuery(`SELECT * FROM "${result.tableName}"`);
+    const queryRes = await executeQuery(`SELECT * FROM "${result.tableName}" LIMIT 1000`);
+    const defaultQuery = `SELECT * FROM "${result.tableName}"`;
+
+    // Create new tab for joined result
+    const newTab: FileTabState = {
+      file: result,
+      queryResult: queryRes,
+      lastQuery: defaultQuery,
+      quickFilter: '',
+      filterModel: null,
+    };
+
+    setTabs(prev => [...prev, newTab]);
+    setActiveTabId(result.tableName);
     setViewMode('data');
   }, [executeQuery]);
 
@@ -130,21 +215,21 @@ function App() {
   }, [clearSavedData]);
 
   const handleQueryExecute = useCallback(async (sql: string) => {
+    if (!activeTabId) return;
     setIsQueryRunning(true);
     setError(null);
     try {
       const result = await executeQuery(sql);
-      setQueryResult(result);
-      setLastQuery(sql);
+      updateTab(activeTabId, { queryResult: result, lastQuery: sql });
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Query failed');
     } finally {
       setIsQueryRunning(false);
     }
-  }, [executeQuery]);
+  }, [activeTabId, executeQuery, updateTab]);
 
   const handleSearch = useCallback(async (pattern: string, column: string | null, useRegex: boolean, caseSensitive: boolean) => {
-    if (!currentFile) return;
+    if (!currentFile || !activeTabId) return;
 
     setIsQueryRunning(true);
     setError(null);
@@ -173,27 +258,25 @@ function App() {
 
       const sql = `SELECT * FROM "${currentFile.tableName}" WHERE ${whereClause}`;
       const result = await executeQuery(sql);
-      setQueryResult(result);
-      setLastQuery(sql);
+      updateTab(activeTabId, { queryResult: result, lastQuery: sql });
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Search failed');
     } finally {
       setIsQueryRunning(false);
     }
-  }, [currentFile, executeQuery]);
+  }, [currentFile, activeTabId, executeQuery, updateTab]);
 
   const handleSearchClear = useCallback(async () => {
-    if (!currentFile) return;
+    if (!currentFile || !activeTabId) return;
     setQuickFilter('');
     try {
       const sql = `SELECT * FROM "${currentFile.tableName}" LIMIT 1000`;
       const result = await executeQuery(sql);
-      setQueryResult(result);
-      setLastQuery(sql);
+      updateTab(activeTabId, { queryResult: result, lastQuery: sql });
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Failed to reset view');
     }
-  }, [currentFile, executeQuery]);
+  }, [currentFile, activeTabId, executeQuery, updateTab, setQuickFilter]);
 
   const handleExport = useCallback(async (format: FileFormat, filename: string) => {
     if (!currentFile) return;
@@ -299,6 +382,17 @@ function App() {
         )}
       </header>
 
+      {/* Tab Bar */}
+      {tabs.length > 0 && (
+        <TabBar
+          tabs={tabs}
+          activeTabId={activeTabId ?? ''}
+          onTabSelect={handleTabSelect}
+          onTabClose={handleTabClose}
+          onAddFile={() => setShowFileSelector(true)}
+        />
+      )}
+
       {/* Restore notification */}
       {restoreNotification && (
         <div className="fixed top-4 right-4 bg-yellow-100 border border-yellow-400 text-yellow-700 px-4 py-2 rounded shadow-lg z-50">
@@ -332,11 +426,19 @@ function App() {
           </div>
         )}
 
-        {!currentFile ? (
+        {(tabs.length === 0 || showFileSelector) ? (
           <div className="flex-1 flex items-center justify-center">
-            <div className="w-full max-w-lg">
+            <div className="w-full max-w-lg relative">
+              {showFileSelector && tabs.length > 0 && (
+                <button
+                  onClick={() => setShowFileSelector(false)}
+                  className="absolute -top-8 right-0 text-gray-500 hover:text-gray-700 text-sm"
+                >
+                  Cancel
+                </button>
+              )}
               <FileDropZone onFileSelect={handleFileSelect} isLoading={isFileLoading} />
-              {loadedFiles.length > 0 && (
+              {loadedFiles.length > 0 && tabs.length === 0 && (
                 <div className="mt-4">
                   <p className="text-sm text-gray-600 mb-2">Previously loaded:</p>
                   <div className="flex flex-wrap gap-2">
@@ -344,10 +446,17 @@ function App() {
                       <button
                         key={f.tableName}
                         onClick={async () => {
-                          setCurrentFile(f);
                           const result = await executeQuery(`SELECT * FROM "${f.tableName}" LIMIT 1000`);
-                          setQueryResult(result);
-                          setLastQuery(`SELECT * FROM "${f.tableName}"`);
+                          const defaultQuery = `SELECT * FROM "${f.tableName}"`;
+                          const newTab: FileTabState = {
+                            file: f,
+                            queryResult: result,
+                            lastQuery: defaultQuery,
+                            quickFilter: '',
+                            filterModel: null,
+                          };
+                          setTabs([newTab]);
+                          setActiveTabId(f.tableName);
                         }}
                         className="px-3 py-1 text-sm bg-gray-200 rounded hover:bg-gray-300"
                       >
@@ -359,7 +468,7 @@ function App() {
               )}
             </div>
           </div>
-        ) : (
+        ) : currentFile && (
           <>
             {/* Search and Export toolbar */}
             <div className="flex gap-4 flex-wrap">
@@ -380,13 +489,7 @@ function App() {
                 />
                 <button
                   type="button"
-                  onClick={(e) => {
-                    e.preventDefault();
-                    e.stopPropagation();
-                    setCurrentFile(null);
-                    setQueryResult(null);
-                    setLastQuery('');
-                  }}
+                  onClick={() => setShowFileSelector(true)}
                   className="px-3 py-2 bg-gray-200 text-gray-700 rounded text-sm hover:bg-gray-300"
                 >
                   Load New File
@@ -405,12 +508,22 @@ function App() {
                   />
                 </div>
                 <div className="w-1/2 flex flex-col min-h-0 overflow-hidden">
-                  <DataGrid ref={dataGridRef} data={queryResult} quickFilterText={quickFilter} />
+                  <DataGrid
+                    ref={dataGridRef}
+                    data={queryResult}
+                    quickFilterText={quickFilter}
+                    initialFilterModel={activeTab?.filterModel}
+                  />
                 </div>
               </div>
             ) : (
               <div className="flex-1 min-h-0 overflow-hidden">
-                <DataGrid ref={dataGridRef} data={queryResult} quickFilterText={quickFilter} />
+                <DataGrid
+                  ref={dataGridRef}
+                  data={queryResult}
+                  quickFilterText={quickFilter}
+                  initialFilterModel={activeTab?.filterModel}
+                />
               </div>
             )}
 

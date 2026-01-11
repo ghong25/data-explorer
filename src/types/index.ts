@@ -1,5 +1,6 @@
 export interface QueryResult {
   columns: string[];
+  columnTypes?: Record<string, string>;
   rows: Record<string, unknown>[];
   rowCount: number;
 }
@@ -23,6 +24,14 @@ export interface LoadedFile {
   format: FileFormat;
   columns: ColumnInfo[];
   rowCount: number;
+}
+
+export interface FileTabState {
+  file: LoadedFile;
+  queryResult: QueryResult | null;
+  lastQuery: string;
+  quickFilter: string;
+  filterModel: Record<string, unknown> | null;
 }
 
 export interface ExportOptions {

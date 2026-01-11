@@ -1,8 +1,9 @@
 import { useMemo, useCallback, useRef, useState, useEffect, forwardRef, useImperativeHandle } from 'react';
 import { AgGridReact } from 'ag-grid-react';
 import { AllCommunityModule, ModuleRegistry, themeQuartz } from 'ag-grid-community';
-import type { ColDef, GridApi, GridReadyEvent, CellValueChangedEvent } from 'ag-grid-community';
+import type { ColDef, GridApi, GridReadyEvent, CellValueChangedEvent, ValueFormatterParams } from 'ag-grid-community';
 import type { QueryResult } from '../types';
+import { isDatetimeType, formatDatetime, mightBeEpochColumn, formatEpoch } from '../utils/dateFormatter';
 
 // Register AG Grid modules
 ModuleRegistry.registerModules([AllCommunityModule]);
@@ -19,15 +20,17 @@ export interface ExportParams {
 export interface DataGridHandle {
   getDisplayedData: () => QueryResult | null;
   getExportParams: () => ExportParams | null;
+  getFilterModel: () => Record<string, unknown> | null;
 }
 
 interface DataGridProps {
   data: QueryResult | null;
   onCellChange?: (rowIndex: number, field: string, oldValue: unknown, newValue: unknown) => void;
   quickFilterText?: string;
+  initialFilterModel?: Record<string, unknown> | null;
 }
 
-export const DataGrid = forwardRef<DataGridHandle, DataGridProps>(function DataGrid({ data, onCellChange, quickFilterText }, ref) {
+export const DataGrid = forwardRef<DataGridHandle, DataGridProps>(function DataGrid({ data, onCellChange, quickFilterText, initialFilterModel }, ref) {
   const gridRef = useRef<AgGridReact>(null);
   const gridApiRef = useRef<GridApi | null>(null);
   const [showColumnSelector, setShowColumnSelector] = useState(false);
@@ -62,17 +65,31 @@ export const DataGrid = forwardRef<DataGridHandle, DataGridProps>(function DataG
     // Use columnOrder to preserve user's drag order
     return columnOrder
       .filter(col => visibleColumns.has(col))
-      .map((col) => ({
-        field: col,
-        headerName: col,
-        sortable: true,
-        filter: true,
-        resizable: true,
-        editable: true,
-        floatingFilter: true,
-        minWidth: 150,
-        width: 200,
-      }));
+      .map((col) => {
+        const colType = data.columnTypes?.[col] ?? '';
+        const isDatetime = isDatetimeType(colType);
+        const isEpoch = !isDatetime && mightBeEpochColumn(col, colType);
+
+        return {
+          field: col,
+          headerName: col,
+          sortable: true,
+          filter: true,
+          resizable: true,
+          editable: true,
+          floatingFilter: true,
+          minWidth: 150,
+          width: (isDatetime || isEpoch) ? 180 : 200,
+          ...(isDatetime && {
+            valueFormatter: (params: ValueFormatterParams) =>
+              formatDatetime(params.value, colType),
+          }),
+          ...(isEpoch && {
+            valueFormatter: (params: ValueFormatterParams) =>
+              formatEpoch(params.value),
+          }),
+        };
+      });
   }, [data, columnOrder, visibleColumns]);
 
   const defaultColDef = useMemo<ColDef>(() => ({
@@ -136,8 +153,18 @@ export const DataGrid = forwardRef<DataGridHandle, DataGridProps>(function DataG
         quickFilterText: quickFilterText || undefined,
         filterModel: gridApiRef.current.getFilterModel() || undefined,
       };
-    }
+    },
+    getFilterModel: (): Record<string, unknown> | null => {
+      return gridApiRef.current?.getFilterModel() ?? null;
+    },
   }), [data, visibleColumns, quickFilterText, columnOrder]);
+
+  // Restore filter model when switching tabs
+  useEffect(() => {
+    if (gridApiRef.current && initialFilterModel) {
+      gridApiRef.current.setFilterModel(initialFilterModel);
+    }
+  }, [initialFilterModel]);
 
   // Sync checkbox row scroll with grid scroll
   const onBodyScroll = useCallback(() => {

@@ -56,6 +56,13 @@ export function useDuckDB() {
 
     const result = await conn.query(sql);
     const columns = result.schema.fields.map(f => f.name);
+
+    // Extract column types from Arrow schema
+    const columnTypes: Record<string, string> = {};
+    for (const field of result.schema.fields) {
+      columnTypes[field.name] = field.type.toString();
+    }
+
     const rows: Record<string, unknown>[] = [];
 
     for (let i = 0; i < result.numRows; i++) {
@@ -67,7 +74,7 @@ export function useDuckDB() {
       rows.push(row);
     }
 
-    return { columns, rows, rowCount: result.numRows };
+    return { columns, columnTypes, rows, rowCount: result.numRows };
   }, [conn]);
 
   const loadFile = useCallback(async (file: File): Promise<LoadedFile> => {
